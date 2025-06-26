@@ -1,0 +1,33 @@
+digraph INFRA {
+  node [ color = "black", fillcolor = "#E6E6E6", height =1, style = "filled,bold,rounded", fontname = "Arial" ];
+  "NotificationEmailParam" [ label = "NotificationEmailParam
+(AWS::SSM::Parameter)", shape =rectangle ];
+  "MonthlyQuotaParam" [ label = "MonthlyQuotaParam
+(AWS::SSM::Parameter)", shape =rectangle ];
+  "NotificationTopic" [ label = "NotificationTopic
+(AWS::SNS::Topic)", shape =rectangle, fillcolor = "#CCE0AC" ];
+  "NotificationSubscription" [ label = "NotificationSubscription
+(AWS::SNS::Subscription)", shape =rectangle, fillcolor = "#CCE0AC" ];
+  "S3UsageTrail" [ label = "S3UsageTrail
+(AWS::CloudTrail::Trail)", shape =rectangle ];
+  "CloudTrailBucket" [ label = "CloudTrailBucket
+(AWS::S3::Bucket)", shape =cylinder, fillcolor = "#FFF5CD" ];
+  "CloudTrailBucketPolicy" [ label = "CloudTrailBucketPolicy
+(AWS::S3::BucketPolicy)", shape =rectangle ];
+  "AthenaDatabase" [ label = "AthenaDatabase
+(AWS::Glue::Database)", shape =cylinder, fillcolor = "#FFCFB3" ];
+  "AthenaTableCreationLambda" [ label = "AthenaTableCreationLambda
+(AWS::Lambda::Function)", shape =rectangle, fillcolor = "#B7E0FF" ];
+  "AthenaTableCreation" [ label = "AthenaTableCreation
+(Custom::AthenaTableCreation)", shape =rectangle ];
+  "S3UsageTable" [ label = "S3UsageTable
+(AWS::DynamoDB::Table)", shape =cylinder, fillcolor = "#FFCFB3" ];
+  "NotificationSubscription" -> "NotificationTopic";
+  "NotificationSubscription" -> "NotificationEmailParam";
+  "S3UsageTrail" -> "CloudTrailBucket";
+  "S3UsageTrail" -> "CloudTrailBucketPolicy";
+  "CloudTrailBucketPolicy" -> "CloudTrailBucket";
+  "AthenaTableCreation" -> "AthenaTableCreationLambda";
+  "AthenaTableCreation" -> "AthenaDatabase";
+  "AthenaTableCreation" -> "CloudTrailBucket";
+}

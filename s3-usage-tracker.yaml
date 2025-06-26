@@ -1,0 +1,1057 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to track S3 GetObject activities hourly'
+
+Mappings:
+  TimeZoneToUTCHour:
+    "-12": { Hour: "12" }
+    "-11": { Hour: "11" }
+    "-10": { Hour: "10" }
+    "-9": { Hour: "9" }
+    "-8": { Hour: "8" }
+    "-7": { Hour: "7" }
+    "-6": { Hour: "6" }
+    "-5": { Hour: "5" }
+    "-4": { Hour: "4" }
+    "-3": { Hour: "3" }
+    "-2": { Hour: "2" }
+    "-1": { Hour: "1" }
+    "0": { Hour: "0" }
+    "1": { Hour: "23" }
+    "2": { Hour: "22" }
+    "3": { Hour: "21" }
+    "4": { Hour: "20" }
+    "5": { Hour: "19" }
+    "6": { Hour: "18" }
+    "7": { Hour: "17" }
+    "8": { Hour: "16" }
+    "9": { Hour: "15" }
+    "10": { Hour: "14" }
+    "11": { Hour: "13" }
+    "12": { Hour: "12" }
+    "13": { Hour: "11" }
+    "14": { Hour: "10" }
+
+Parameters:
+  NotificationEmails:
+    Type: CommaDelimitedList
+    Description: 'Comma-separated list of email addresses for S3 usage notifications'
+    Default: 'eugenelq@amazon.com'
+  MonthlyQuota:
+    Type: String
+    Description: 'Monthly data transfer quota in MB'
+    Default: '100'
+  TimeZoneOffset:
+    Type: Number
+    Description: 'UTC offset for daily report schedule (e.g., 8 for Singapore/UTC+8, -5 for EST/UTC-5)'
+    Default: 8
+    MinValue: -12
+    MaxValue: 14
+
+Resources:
+
+  MonthlyQuotaParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/s3usage/monthly-quota'
+      Type: String
+      Value: !Ref MonthlyQuota
+      Description: 'Monthly data transfer quota in bytes'
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'S3 Usage Alerts'
+
+  EmailSubscriptionManager:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt NotificationLambdaIAMRole.Arn
+      Runtime: python3.12
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  sns = boto3.client('sns')
+                  topic_arn = event['ResourceProperties']['TopicArn']
+                  emails = event['ResourceProperties']['Emails']
+                  
+                  if event['RequestType'] == 'Create':
+                      for email in emails:
+                          sns.subscribe(
+                              TopicArn=topic_arn,
+                              Protocol='email',
+                              Endpoint=email.strip()
+                          )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  CreateEmailSubscriptions:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EmailSubscriptionManager.Arn
+      TopicArn: !Ref NotificationTopic
+      Emails: !Ref NotificationEmails
+
+  # CloudTrail to log S3 GetObject activities
+  S3UsageTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailBucket
+      TrailName: S3UsageTrail
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false  # Set to true if you want multi-region trail
+      EventSelectors:
+        - ReadWriteType: ReadOnly
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - 'arn:aws:s3'
+
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/S3UsageTrail
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/S3UsageTrail
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: AllowAthenaAccess
+            Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action: 
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Resource: 
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub ${CloudTrailBucket.Arn}/*
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Resource: 
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub ${CloudTrailBucket.Arn}/*
+
+  # Athena Database
+  AthenaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: s3_usage_db
+        Description: Database for S3 usage analysis
+
+  # Athena Table for CloudTrail logs
+  AthenaTableCreationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def lambda_handler(event, context):
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+
+              try:
+                  athena_client = boto3.client('athena')
+                  
+                  # Create CloudTrail table
+                  query = '''
+                  CREATE EXTERNAL TABLE cloudtrail_logs(
+                  eventversion STRING,
+                  useridentity STRUCT<
+                      type: STRING,
+                      principalid: STRING,
+                      arn: STRING,
+                      accountid: STRING,
+                      invokedby: STRING,
+                      accesskeyid: STRING,
+                      username: STRING,
+                      onbehalfof: STRUCT<
+                          userid: STRING,
+                          identitystorearn: STRING>,
+                      sessioncontext: STRUCT<
+                          attributes: STRUCT<
+                              mfaauthenticated: STRING,
+                              creationdate: STRING>,
+                          sessionissuer: STRUCT<
+                              type: STRING,
+                              principalid: STRING,
+                              arn: STRING,
+                              accountid: STRING,
+                              username: STRING>,
+                          ec2roledelivery:string,
+                          webidfederationdata: STRUCT<
+                              federatedprovider: STRING,
+                              attributes: map<string,string>>
+                          >
+                      >,
+                      eventtime STRING,
+                      eventsource STRING,
+                      eventname STRING,
+                      awsregion STRING,
+                      sourceipaddress STRING,
+                      useragent STRING,
+                      errorcode STRING,
+                      errormessage STRING,
+                      requestparameters STRING,
+                      responseelements STRING,
+                      additionaleventdata STRING,
+                      requestid STRING,
+                      eventid STRING,
+                      readonly STRING,
+                      resources ARRAY<STRUCT<
+                          arn: STRING,
+                          accountid: STRING,
+                          type: STRING>>,
+                      eventtype STRING,
+                      apiversion STRING,
+                      recipientaccountid STRING,
+                      serviceeventdetails STRING,
+                      sharedeventid STRING,
+                      vpcendpointid STRING,
+                      vpcendpointaccountid STRING,
+                      eventcategory STRING,
+                      addendum STRUCT<
+                      reason:STRING,
+                      updatedfields:STRING,
+                      originalrequestid:STRING,
+                      originaleventid:STRING>,
+                      sessioncredentialfromconsole STRING,
+                      edgedevicedetails STRING,
+                      tlsdetails STRUCT<
+                      tlsversion:STRING,
+                      ciphersuite:STRING,
+                      clientprovidedhostheader:STRING>
+                  )
+                  PARTITIONED BY (
+                      `timestamp` string)
+                  ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'
+                  STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+                  OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+                  LOCATION 's3://{bucket}/AWSLogs/{account_id}/CloudTrail/{region}/'
+                  TBLPROPERTIES (
+                  'projection.enabled'='true', 
+                  'projection.timestamp.format'='yyyy/MM/dd', 
+                  'projection.timestamp.interval'='1', 
+                  'projection.timestamp.interval.unit'='DAYS', 
+                  'projection.timestamp.range'='2020/01/01,NOW', 
+                  'projection.timestamp.type'='date', 
+                  'storage.location.template'='s3://{bucket}/AWSLogs/{account_id}/CloudTrail/{region}/${{timestamp}}')
+                  '''.format(
+                    bucket=event['ResourceProperties']['BucketName'],
+                    account_id=event['ResourceProperties']['AccountId'],
+                    region=event['ResourceProperties']['Region']
+                  )
+
+                  print(query)
+                  
+                  response = athena_client.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={
+                          'Database': event['ResourceProperties']['ATHENA_DATABASE']
+                      },
+                      ResultConfiguration={
+                        'OutputLocation': 's3://{}/athena-results/'.format(event['ResourceProperties']['BucketName'])
+                      }
+                  )
+                  
+                  # Wait for query to complete
+                  query_execution_id = response['QueryExecutionId']
+                  state = 'RUNNING'
+                  
+                  while state == 'RUNNING' or state == 'QUEUED':
+                      response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+                      state = response['QueryExecution']['Status']['State']
+                      if state == 'FAILED' or state == 'CANCELLED':
+                          raise Exception('Athena query failed: ' + response['QueryExecution']['Status']['StateChangeReason'])
+                      time.sleep(1)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+  
+  # Create Athena Table Custom Resource
+  AthenaTableCreation:
+    Type: Custom::AthenaTableCreation
+    DependsOn: AthenaDatabase
+    Properties:
+      ServiceToken: !GetAtt AthenaTableCreationLambda.Arn
+      BucketName: !Ref CloudTrailBucket
+      AccountId: !Ref AWS::AccountId
+      Region: !Ref AWS::Region
+      ATHENA_DATABASE: s3_usage_db
+
+  # DynamoDB Table to store S3 usage data
+  S3UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: S3UsageMetrics
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+        - AttributeName: YearMonth
+          AttributeType: S
+        - AttributeName: Date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: DateIndex
+          KeySchema:
+            - AttributeName: YearMonth
+              KeyType: HASH
+            - AttributeName: Date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # DynamoDB Table to store notification
+  S3UsageNotificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: S3UsageNotifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: MonthYear
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: MonthYear
+          KeyType: HASH
+        - AttributeName: UserId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # Lambda Function to query Athena and store results in DynamoDB
+  S3UsageTrackerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AthenaTableCreation
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          ATHENA_DATABASE: s3_usage_db
+          ATHENA_TABLE: cloudtrail_logs
+          S3USAGE_DDB: !Ref S3UsageTable
+          NOTIFICATION_DDB: !Ref S3UsageNotificationTable
+          ATHENA_OUTPUT_LOCATION: !Sub s3://${CloudTrailBucket}/athena-results/
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import os
+          import json
+          from datetime import datetime, timedelta, timezone
+          import uuid
+          import ipaddress
+          from boto3.dynamodb.conditions import Key, Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          s3_usage_ddb = os.environ['S3USAGE_DDB']
+          s3_usage_table = dynamodb.Table(s3_usage_ddb)
+
+          def is_public_ip(ip_str):
+              try:
+                  ip = ipaddress.ip_address(ip_str)
+                  return not ip.is_private and not ip.is_loopback and not ip.is_reserved and not ip.is_link_local
+              except ValueError:
+                  return False
+
+          def get_quota_and_email():
+              ssm = boto3.client('ssm')
+              quota_response = ssm.get_parameter(Name='/s3usage/monthly-quota')
+              return float(quota_response['Parameter']['Value'])
+
+          def send_notification(monthly_quota, topic_arn, exceeded_users):
+              sns = boto3.client('sns')
+
+              if not exceeded_users:
+                  return
+                  
+              message = f"The following users have exceeded their monthly data transfer quota ({monthly_quota}MB):\n\n"
+              for user in exceeded_users:
+                  message += f"User: {user['UserId']}\n"
+                  message += f"Account: {user['AccountId']}\n"
+                  message += f"Data Transferred: {user['TotalBytesTransferred']/1024/1024:.2f} MB\n"
+                  message += f"Source IP: {user['SourceIPAddress']}\n"
+                  message += f"------\n"
+
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject="S3 Data Transfer Quota Exceeded",
+                  Message=message
+              )
+
+          def check_and_store_notifications(unique_users, year_month):
+              """Check if users already exist in notification table for this month and store new ones"""
+              notification_table = dynamodb.Table(os.environ['NOTIFICATION_DDB'])
+              users_to_notify = []
+              monthly_quota = get_quota_and_email()
+
+              for user in unique_users:
+                  print(user)
+                  total_bytes, user_details = get_monthly_usage(user, year_month)
+                  if (total_bytes/1024/1024) > monthly_quota and user_details:
+                      # Check if user already has a notification for this month
+                      response = notification_table.get_item(
+                          Key={
+                              'MonthYear': year_month,
+                              'UserId': user
+                          }
+                      )
+                      print(response, {
+                                  'UserId': user_details['UserId'],
+                                  'YearMonth': year_month,
+                                  'UserARN': user_details['UserARN'],
+                                  'AccountId': user_details['AccountId'],
+                                  'Username': user_details['Username'],
+                                  'TotalBytesTransferred': int(total_bytes),
+                                  'MonthlyQuota': monthly_quota,
+                                  'SourceIPAddress': user_details['SourceIPAddress'],
+                                  'NotificationTime': datetime.now(timezone.utc).isoformat(),
+                                  'TTL': int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())
+                              })
+                      
+                      # If user doesn't exist in notification table for this month, add them
+                      if 'Item' not in response:
+                          # Store in notification DynamoDB
+                          userDet = {
+                                  'UserId': user_details['UserId'],
+                                  'MonthYear': year_month,
+                                  'UserARN': user_details['UserARN'],
+                                  'AccountId': user_details['AccountId'],
+                                  'Username': user_details['Username'],
+                                  'TotalBytesTransferred': total_bytes,
+                                  'MonthlyQuota': int(monthly_quota),
+                                  'SourceIPAddress': user_details['SourceIPAddress'],
+                                  'NotificationTime': datetime.now(timezone.utc).isoformat(),
+                                  'TTL': int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())
+                              }
+                          notification_table.put_item(
+                              Item=userDet
+                          )
+                          # Add to list of users to notify
+                          users_to_notify.append(userDet)
+              
+              return users_to_notify
+
+          def get_monthly_usage(user_id, year_month):
+              """Query DynamoDB for user's monthly usage"""
+              response = s3_usage_table.query(
+                  KeyConditionExpression=Key('UserId').eq(user_id) & Key('Timestamp').begins_with(year_month),
+                  ProjectionExpression='UserId, BytesTransferredOut, UserARN, AccountId, Username, SourceIPAddress'
+              )
+              
+              total_bytes = sum(item['BytesTransferredOut'] for item in response['Items'])
+              
+              # Get user details from the last item
+              user_details = response['Items'][-1] if response['Items'] else None
+              
+              return total_bytes, user_details
+
+          def handler(event, context):
+              # Initialize clients
+              athena = boto3.client('athena')
+              
+              # Get environment variables
+              database = os.environ['ATHENA_DATABASE']
+              athena_table_name = os.environ['ATHENA_TABLE']
+              notification_ddb = os.environ['NOTIFICATION_DDB']
+              output_location = os.environ['ATHENA_OUTPUT_LOCATION']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+
+              # Get quota and notification email
+              monthly_quota = get_quota_and_email()
+              
+              # Calculate time range for the query (last hour)
+              utc_now = datetime.now(timezone.utc)
+              utc_offset = timedelta(hours=8)
+              local_time = utc_now + utc_offset
+              
+              # Check if we're before 00:35, use previous day if so
+              if local_time.hour == 0 and local_time.minute < 35:
+                  local_time = local_time - timedelta(days=1)
+              
+              # Check if today is 1st of the month, use previous day if so
+              if local_time.day == 1:
+                  # Calculate previous day (last day of previous month)
+                  prev_day = local_time - timedelta(days=1)
+                  
+                  # Set start time to beginning of the previous day (00:00:00) in UTC+8
+                  start_time_local = datetime(prev_day.year, prev_day.month, prev_day.day, 0, 0, 0)
+                  
+                  # Set end time to end of the previous day (23:59:59) in UTC+8
+                  end_time = datetime(prev_day.year, prev_day.month, prev_day.day, 23, 59, 59)
+                  
+                  # Special case: if it's between 00:00 and 00:10 on the 1st day, use entire previous month
+                  if local_time.hour == 0 and local_time.minute < 10:
+                      # Calculate previous month
+                      if prev_day.month == 1:  # If previous day was in January
+                          prev_month = 12
+                          prev_year = prev_day.year - 1
+                      else:
+                          prev_month = prev_day.month
+                          prev_year = prev_day.year
+                          
+                      # Start of previous month in UTC+8
+                      start_time_local = datetime(prev_year, prev_month, 1, 0, 0, 0)
+              else:
+                  # Set start time to beginning of the day (00:00:00) in UTC+8
+                  start_time_local = datetime(local_time.year, local_time.month, local_time.day, 0, 0, 0)
+                  
+                  # Set end time to end of the day (23:59:59) in UTC+8
+                  end_time = datetime(local_time.year, local_time.month, local_time.day, 23, 59, 59)
+              
+              # Format timestamps for the query - keeping them in UTC+8 format
+              start_time_str = start_time_local.strftime('%Y-%m-%dT%H:%M:%S')
+              end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%S')
+                  
+              print(f"Query time range: {start_time_str} to {end_time_str}")
+
+              # Construct the Athena query
+              query = f"""
+              SELECT 
+                  useridentity.arn as user_arn,
+                  useridentity.accountid as account_id,
+                  useridentity.username as username,
+                  sourceipaddress,
+                  SUM(CAST(json_extract_scalar(additionalEventData, '$.bytesTransferredOut') AS bigint)) as bytes_transferred_out,
+                  COUNT(*) as request_count
+              FROM 
+                  {database}.{athena_table_name}
+              WHERE 
+                  eventname = 'GetObject' 
+                  AND eventsource = 's3.amazonaws.com'
+                  AND eventtime BETWEEN '{start_time_str}' AND '{end_time_str}'
+                  AND additionalEventData LIKE '%bytesTransferredOut%'
+              GROUP BY 
+                  useridentity.arn, useridentity.accountid, useridentity.username, sourceipaddress
+              """
+              print(query)
+              # Start the Athena query
+              query_execution = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={
+                      'Database': database
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': output_location
+                  }
+              )
+              
+              query_execution_id = query_execution['QueryExecutionId']
+              
+              # Wait for the query to complete
+              state = 'RUNNING'
+              while state in ['RUNNING', 'QUEUED']:
+                  response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+                  state = response['QueryExecution']['Status']['State']
+                  
+                  if state in ['FAILED', 'CANCELLED']:
+                      raise Exception(f"Query failed to run with error: {response['QueryExecution']['Status']['StateChangeReason']}")
+                  
+                  if state == 'SUCCEEDED':
+                      break
+                      
+                  time.sleep(1)
+              
+              # Get the query results
+              results = athena.get_query_results(QueryExecutionId=query_execution_id)
+              
+              # Process the results and store in DynamoDB
+              timestamp = end_time.strftime('%Y-%m-%d-%H')
+              yearMonth = end_time.strftime('%Y-%m')
+              date = end_time.strftime('%Y-%m-%d')
+              
+              # Skip the header row
+              rows = results['ResultSet']['Rows'][1:]
+              
+              for row in rows:
+                  data = row['Data']
+                  
+                  # Extract values (handle potential None values)
+                  user_arn = data[0].get('VarCharValue', 'unknown') if data[0] else 'unknown'
+                  account_id = data[1].get('VarCharValue', 'unknown') if data[1] else 'unknown'
+                  username = data[2].get('VarCharValue', 'unknown') if data[2] else 'unknown'
+                  bytes_transferred = int(data[4].get('VarCharValue', '0')) if data[3] else 0
+                  request_count = int(data[5].get('VarCharValue', '0')) if data[4] else 0
+                  sourceipaddress = data[3].get('VarCharValue', 'unknown') if data[5] else 'unknown'
+
+                  # Create a user ID from the ARN or username
+                  user_id = username if username != 'unknown' else user_arn.split('/')[-1]
+                  
+                  if is_public_ip(sourceipaddress):
+                      # Store in DynamoDB
+                      s3_usage_table.put_item(
+                          Item={
+                              'UserId': user_id,
+                              'Timestamp': timestamp,
+                              'Date': date,
+                              'UserARN': user_arn,
+                              'AccountId': account_id,
+                              'Username': username,
+                              'BytesTransferredOut': bytes_transferred,
+                              'RequestCount': request_count,
+                              'SourceIPAddress': sourceipaddress,
+                              'YearMonth': yearMonth,
+                              'TTL': int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp())  # 90-day TTL
+                          }
+                      )
+              
+              # Get unique users from today's data
+              response = s3_usage_table.query(
+                  IndexName='DateIndex',
+                  KeyConditionExpression='#yearMonth = :yearMonth AND #date = :date',
+                  ExpressionAttributeNames={
+                      '#date': 'Date',
+                      '#yearMonth': 'YearMonth'
+                  },
+                  ExpressionAttributeValues={
+                      ':yearMonth': yearMonth,
+                      ':date': date,
+                  },
+                  ProjectionExpression='UserId'
+              )
+
+              # Track users who exceeded quota
+              # exceeded_users = []
+              unique_users = {item['UserId'] for item in response['Items']}
+              users_to_notify = check_and_store_notifications(unique_users, yearMonth)
+              
+              
+              # # Check monthly usage for each user
+              # for user_id in unique_users:
+              #     total_bytes, user_details = get_monthly_usage(table, user_id, yearMonth)
+              #     print(total_bytes, monthly_quota, user_details)
+              #     if (total_bytes/1024/1024) > monthly_quota and user_details:
+              #         exceeded_users.append({
+              #             'UserId': user_id,
+              #             'UserARN': user_details['UserARN'],
+              #             'AccountId': user_details['AccountId'],
+              #             'Username': user_details['Username'],
+              #             'TotalBytesTransferred': total_bytes,
+              #             'MonthlyQuota': monthly_quota,
+              #             'SourceIPAddress': user_details['SourceIPAddress']
+              #         })
+              
+              # Send notification if any users exceeded quota
+              if users_to_notify:
+                  send_notification(monthly_quota, sns_topic_arn, users_to_notify)
+              
+              print(users_to_notify)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Exceeded users: {len(users_to_notify)}')
+              }
+
+
+
+  # Lambda Function to send reports daily
+  S3UsageDailyReportLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AthenaTableCreation
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          S3USAGE_DDB: !Ref S3UsageTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import os
+          import json
+          from datetime import datetime, timedelta, timezone
+          import uuid
+          import ipaddress
+          from boto3.dynamodb.conditions import Key, Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          s3_usage_ddb = os.environ['S3USAGE_DDB']
+          s3_usage_table = dynamodb.Table(s3_usage_ddb)
+
+          def get_quota_and_email():
+              ssm = boto3.client('ssm')
+              quota_response = ssm.get_parameter(Name='/s3usage/monthly-quota')
+              return float(quota_response['Parameter']['Value'])
+
+          def send_notification(monthly_quota, topic_arn, exceeded_users):
+              sns = boto3.client('sns')
+
+              if not exceeded_users:
+                  return
+                  
+              message = f"The following users have exceeded their monthly data transfer quota ({monthly_quota}MB):\n\n"
+              for user in exceeded_users:
+                  message += f"User: {user['UserId']}\n"
+                  message += f"Account: {user['AccountId']}\n"
+                  message += f"Data Transferred: {user['TotalBytesTransferred']/1024/1024:.2f} MB\n"
+                  message += f"------\n"
+
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject="Daily Report for S3 Transfer Out",
+                  Message=message
+              )
+
+          def retrieve_exceeded_users(unique_users, year_month):
+              """Check if users already exist in notification table for this month and store new ones"""
+              users_to_notify = []
+              monthly_quota = get_quota_and_email()
+
+              for user in unique_users:
+                  total_bytes, user_details = get_monthly_usage(user, year_month)
+                  print(user, total_bytes, user_details)
+                  
+                  if (total_bytes/1024/1024) > monthly_quota and user_details:
+                      user_details['TotalBytesTransferred'] = total_bytes
+                      users_to_notify.append(user_details)
+              
+              return users_to_notify
+                
+          def get_monthly_usage(user_id, year_month):
+              """Query DynamoDB for user's monthly usage"""
+              response = s3_usage_table.query(
+                  KeyConditionExpression=Key('UserId').eq(user_id) & Key('Timestamp').begins_with(year_month),
+                  ProjectionExpression='UserId, BytesTransferredOut, UserARN, AccountId, Username, SourceIPAddress'
+              )
+              
+              total_bytes = sum(item['BytesTransferredOut'] for item in response['Items'])
+              
+              # Get user details from the last item
+              user_details = response['Items'][-1] if response['Items'] else None
+              
+              return total_bytes, user_details
+
+          def handler(event, context):
+              # Initialize clients
+              athena = boto3.client('athena')
+              
+              # Get environment variables
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+
+              # Get quota and notification email
+              monthly_quota = get_quota_and_email()
+              
+              # Calculate time range for the query (last hour)
+              utc_now = datetime.now(timezone.utc)
+              utc_offset = timedelta(hours=8)
+              local_time = utc_now + utc_offset
+              
+              # Get yesterday's date in local time
+              yesterday_local = local_time - timedelta(days=1)
+
+              # Process the results and store in DynamoDB
+              yearMonth = yesterday_local.strftime('%Y-%m')
+              
+              unique_users = set()
+              last_evaluated_key = None
+              # Get unique users from today's data
+              while True:
+                  # Prepare query parameters
+                  query_params = {
+                      'IndexName': 'DateIndex',
+                      'KeyConditionExpression': '#yearMonth = :yearMonth',
+                      'ExpressionAttributeNames': {
+                          '#yearMonth': 'YearMonth'
+                      },
+                      'ExpressionAttributeValues': {
+                          ':yearMonth': yearMonth
+                      },
+                      'ProjectionExpression': 'UserId'
+                  }
+                  
+                  # Add ExclusiveStartKey if we have a LastEvaluatedKey from previous query
+                  if last_evaluated_key:
+                      query_params['ExclusiveStartKey'] = last_evaluated_key
+                  
+                  # Execute the query
+                  response = s3_usage_table.query(**query_params)
+                  
+                  # Add results to our set of unique users
+                  for item in response['Items']:
+                      unique_users.add(item['UserId'])
+                  
+                  # Check if there are more results
+                  if 'LastEvaluatedKey' in response:
+                      last_evaluated_key = response['LastEvaluatedKey']
+                  else:
+                      # No more results, exit the loop
+                      break
+
+              # Track users who exceeded quota
+              # exceeded_users = []
+              print('unique_users', unique_users)
+              users_to_notify = retrieve_exceeded_users(unique_users, yearMonth)
+              
+              # Send notification if any users exceeded quota
+              if users_to_notify:
+                  send_notification(monthly_quota, sns_topic_arn, users_to_notify)
+              
+              print(users_to_notify)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Exceeded users: {len(users_to_notify)}')
+              }
+
+
+
+  # CloudWatch Event Rule to trigger Lambda hourly
+  HourlyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger S3 usage tracker Lambda function hourly"
+      ScheduleExpression: "cron(0 * * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3UsageTrackerLambda.Arn
+          Id: "S3UsageTrackerTarget"
+
+  # CloudWatch Event Rule to trigger daily report Lambda at 12am local time
+  DailyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "Trigger S3 usage daily report Lambda function at 12am UTC${TimeZoneOffset}"
+      ScheduleExpression: !Sub 
+        - "cron(0 ${Hour} * * ? *)"
+        - Hour: !FindInMap [TimeZoneToUTCHour, !Ref TimeZoneOffset, Hour]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3UsageDailyReportLambda.Arn
+          Id: "S3UsageDailyReportTarget"
+
+  # Permission for CloudWatch to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3UsageTrackerLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt HourlyEventRule.Arn
+
+  # Permission for CloudWatch to invoke daily report Lambda
+  DailyLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3UsageDailyReportLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DailyEventRule.Arn
+
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3UsageTrackerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:GetQueryResults'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'glue:CreateDatabase'
+                  - 'glue:GetDatabase'
+                  - 'glue:GetTable'
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:GetPartitions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:ListMultipartUploadParts'
+                  - 's3:AbortMultipartUpload'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt CloudTrailBucket.Arn
+                  - !Sub ${CloudTrailBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:Query'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                Resource: 
+                  - !GetAtt S3UsageTable.Arn
+                  - !Sub '${S3UsageTable.Arn}/index/*'
+                  - !GetAtt S3UsageNotificationTable.Arn
+                  - !Sub '${S3UsageNotificationTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                Resource: 
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/s3usage/*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref NotificationTopic
+
+
+  NotificationLambdaIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns: 
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Ref NotificationLambdaIAMPolicy
+      Description: "Allows Lambda functions to call AWS services on your behalf."
+
+  NotificationLambdaIAMPolicy:
+      Type: AWS::IAM::ManagedPolicy
+      Properties:
+        PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:${AWS::Partition}:s3:::${AWS::StackName}*"
+                  ],
+                  "Action": [
+                    "s3:ListBucket",
+                    "s3:GetObject"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Resource": [
+                    "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}*"
+                  ],
+                  "Action": [
+                    "sns:Publish",
+                    "sns:Subscribe"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "codepipeline:PutJobSuccessResult",
+                    "codepipeline:PutJobFailureResult",
+                    "ec2:DescribeInstances",
+                    "ec2:CreateNetworkInterface",
+                    "ec2:AttachNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:DeleteNetworkInterface"
+                  ],
+                  "Resource": [
+                    "*"
+                  ]
+                }
+              ]
+            }
+Outputs:
+  CloudTrailBucketName:
+    Description: "Name of the S3 bucket storing CloudTrail logs"
+    Value: !Ref CloudTrailBucket
+  DynamoDBTableName:
+    Description: "Name of the DynamoDB table storing S3 usage metrics"
+    Value: !Ref S3UsageTable
+  LambdaFunctionName:
+    Description: "Name of the Lambda function processing S3 usage data"
+    Value: !Ref S3UsageTrackerLambda
