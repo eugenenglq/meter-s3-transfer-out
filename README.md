@@ -22,9 +22,7 @@ The system uses AWS CloudTrail to capture S3 GetObject events, processes them th
 ## Repository Structure
 ```
 .
-├── optimized_lambda.py     # Optimized Lambda handler with caching and batch processing
 ├── s3-usage-tracker.yaml  # CloudFormation template defining infrastructure resources
-└── v2.py                  # Original Lambda implementation for S3 usage tracking
 ```
 
 ## Usage Instructions
